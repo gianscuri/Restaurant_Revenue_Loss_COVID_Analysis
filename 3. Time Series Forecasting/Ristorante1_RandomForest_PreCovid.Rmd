@@ -1,0 +1,1224 @@
+---
+title: "Random Forest - Ristorante 1"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '5'
+  beamer_presentation:
+    colortheme: lily
+    fig_caption: no
+    fig_height: 6
+    fig_width: 7
+    fonttheme: structurebold
+    theme: Hannover
+    toc: yes
+  prettydoc::html_pretty:
+    df_print: paged
+    highlight: vignette
+    theme: architect
+    toc: yes
+    toc_depth: 5
+  pdf_document:
+    toc: yes
+    toc_depth: 5
+  slidy_presentation:
+    highlight: default
+  ioslides_presentation:
+    css:
+    - css/fonts.css
+    - css/custom.css
+    - css/title-slide.css
+    - css/slide-background.css
+    includes:
+      before_body: html/TimeSeriesAnalysis.html
+    toc: yes
+    transition: default
+    widescreen: yes
+course: Progetto Data Science Lab
+---
+
+# Setup
+
+```{r}
+# Clean Workspace
+rm(list=ls())
+```
+
+```{r setup, include=FALSE}
+# Use 'verbatim = TRUE' as chunk option to show chunk code as is
+require(knitr)
+hook_source_def = knit_hooks$get('source')
+knit_hooks$set(source = function(x, options){
+  if (!is.null(options$verbatim) && options$verbatim){
+    opts = gsub(",\\s*verbatim\\s*=\\s*TRUE\\s*", "", options$params.src)
+    bef = sprintf('\n\n    ```{r %s}\n', opts, "\n")
+    stringr::str_c(bef, paste(knitr:::indent_block(x, "    "), collapse = '\n'), "\n    ```\n")
+  } else {
+     hook_source_def(x, options)
+  }
+})
+```
+
+```{r}
+set.seed(100)
+
+# Setting librerie utili
+# Package names
+packages <- c("readxl",  "readr", "forecast", "dplyr", "ggplot2",
+              "lubridate", "KFAS", "tseries", "xts", "randomForest") 
+
+# Install packages if not yet installed
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+# Packages loading
+invisible(lapply(packages, library, character.only = TRUE))
+
+
+# Setting working directory
+# working_dir = "C:/Users/marco/OneDrive/UNIMIB_DataScience/99-PROJECTS/DataScienceLab2022/Dati ristoranti"
+# setwd(working_dir)
+
+# MAPE 
+mape <- function(actual,pred){
+  mape <- mean(abs((actual - pred)/actual))*100
+  return (mape)
+}
+
+#MSE
+rmse <- function(actual, pred){
+  rmse <- sqrt(mean((actual - pred)^2))
+  return (rmse)
+}
+
+# Significatività dei parametri
+pars_test <- function(coef, var_coef){
+  test <- (1-pnorm(abs(coef)/sqrt(diag(var_coef))))*2
+  return(test)
+}
+
+# Grafico errore percentuale 
+err_plot <- function(actual, pred){
+  require(xts)
+  err_perc <- ((actual - xts(pred, order.by = index(actual)))/(xts(actual, order.by = index(actual))))*100
+  return(plot(err_perc, ylab="% errore", main="Errore percentuale di previsione"))
+
+}
+```
+
+# Load data
+
+```{r}
+# file: Dati ristoranti\pre-covid_r1.csv
+r1 <- read.csv("..\\Dati ristoranti\\pre-covid_r1.csv")
+r1$data  <- parse_date(r1$data, "%Y-%m-%d", locale = locale("it"))
+head(r1)
+```
+
+# Data preparation
+
+Definisco la serie storica y
+
+-   come oggetto xts.
+
+-   Indice la data
+
+```{r}
+# Tengo
+rf_r1 <- xts(r1[, "lordototale"], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+```
+
+```{r}
+train_ndx <- nrow(r1)*0.8
+validation_ndx <- train_ndx*0.9
+```
+
+# MODELLO 1: PREVISIONE SOLO ATTRAVERSO I RITARDI DELLA SERIE STORICA
+
+```{r}
+# Spilitting in train/validation/test
+train_validation <- rf_r1[1:train_ndx, ]
+train <- train_validation[1:validation_ndx, ]
+validation <- train_validation[-c(1:validation_ndx), ]
+test <- rf_r1[-c(1:train_ndx), ]
+```
+
+## Costruzione della matrice dei ritardi
+
+-   Prende il lordo totale del train (non del validation) e costruisce una matrice in cui la prima colonna sono i valori del lordo totale ai vari istanti, le colonne successive sono 14 ritardi partendo da ogni istante temporale
+
+-   I primi 14 non sono considerati e quindi sono tolte le prime 14 osservazioni -\> per prevedere il modello ha bisogno dei dati precedenti
+
+-   la prima colonna è y, le altre y1,y14
+
+-   È una normale matrice (non xts)
+
+```{r}
+# Tieni
+# Ho provato con solo 7 ritardi, e le performance erano piuttosto scadenti. Con 14 ritardi (2 settimane) i risultati sono decisamente migliori
+Y <- embed(train, 15) # numero di ritardi + 1 che vogliamo considerare
+colnames(Y) <- c("y", paste0("y_", 1:14))
+```
+
+## Train modello
+
+Train:
+
+-   Passi la prima colonna che dipende dal resto (contro tutti gli altri regressori `.`)
+
+-   Il modello prende una normale matrice (no xts e non ts)
+
+```{r}
+rf1 <- randomForest(y~., data = Y)
+print(rf1)
+```
+
+## Costruzione vettore stime - stima ricorsiva (ogni valore stimato viene utilizzato per prevedere il successivo)
+
+Stime:
+
+-   Carico la ground truth in y_hat
+
+<!-- -->
+
+-   Stimo il primo orizzonte temporale (1 step)
+
+-   La stima step viene messo dentro la matrice, come regressori (perchè ricorda che hai bisogno di 14 dati precedenti)
+
+```{r}
+# TIENI -> Vettore in cui salvo le previsioni
+y_hat <- numeric(nrow(validation)) # Test con 39 osservazioni da stimare
+
+# Matrice per le previsioni ricorsive
+
+# Predo l'ultima riga del train (dato più recedente) a cui tolgo l'ultimo ritardo (l'ultima colonna)
+# Crea il nuovo set di regressori per la previsione dopo (13 del dato prima a cui viene messo in coda il dato più recente come primo regressore)
+X <- Y[nrow(Y), -15, drop = FALSE] # Ultima riga della matrice utilizzata per il training, a cui tolgo il 7° ritardo (questi sono i ritardi per prevedere il valore al tempo t+1)
+colnames(X) <- colnames(Y)[-1] # Il modello ha bisogno dei nomi esatti
+```
+
+## Previsioni
+
+Predict:
+
+-   rf1 è il modello
+
+-   X è il vettore che contiene la nuova riga di regressori, manca solo la colonna y
+
+    -   Li usa come regressori per una predizione one step
+
+    -   X viene shiftato, eliminato il dato più vecchio, stima predetta come y1
+
+-   Ottengo quindi y_hat che è il vettore delle predizioni
+
+-   Il numero di step viene assegnato come nrow(validation)
+
+-   I risultati sono VETTORI -\> alla fine y_hat è convertito in xts e gli sono passate le date del validation xts
+
+```{r}
+for (h in 1:nrow(validation)) {
+  y_hat[h] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti e a prenderne la mediana (in alternativa, la media)
+  # Produco lo shift in X
+  # X viene aggionrato ogni volta, le stime entrano dei regressori
+  X[1, 2:14] <- X[1, 1:13]
+  X[1, 1] <- y_hat[h]
+}
+
+rf_pred1 <- as.xts(y_hat, order.by = date(validation))
+```
+
+## Confronto previsioni vs. test
+
+```{r}
+plot(validation, type = "l")
+lines(rf_pred1, type = "l", col = "red")
+```
+
+## Performance
+
+```{r}
+mape(validation, rf_pred1)
+rmse(validation, rf_pred1)
+```
+
+# SECONDO MODELLO - REGRESSORI (Giorno dell'anno, Giorno della settimana, Festivo, Pioggia)
+
+# Per questo modello e per il successivo sarebbe necessario de-trendizzare la serie storica, essendo il trend una componente che i modelli di ML non possono prevedere. Tuttavia, nel train non si nota un trend evidente, pertanto ritengo non necessario procedere con questa trasformazione
+
+Il secondo e il terzo modello sono simili
+
+-   La cosa dei ritardi viene fatta in modo diverso
+
+-   Avviene comunque la stima ricorsiva
+
+-   In questo caso stima e training avvengono contestualmente nel momento di definizione del modello
+
+-   
+
+Pre processing da inserire
+
+```{r}
+# Tengo Festivo e Pioggia come regressori
+
+# Prendo r1 (dataset importato) e tengo 3 colonne, convertite in xts
+rf_r1 <- xts(r1[, c("lordototale", "Festivo", "Pioggia")], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+
+# Imputazione 
+rf_r1$Festivo[rf_r1$Festivo=="False"] <- 0
+rf_r1$Festivo[rf_r1$Festivo=="True"] <- 1
+
+rf_r1$Pioggia[rf_r1$Pioggia==""] <- 0
+rf_r1$Pioggia[rf_r1$Pioggia=="True"] <- 1
+```
+
+Costruisco due variabili (yday e wday) che sono degli interi, uno che va da 0 a 265 e uno da 0 a 7, indicano giorno dell'anno e della settimana (sono degli indici per dire alla serie storica)
+
+```{r}
+# Costruisco i regressori da 0
+
+yday <- yday(time(rf_r1))
+wday <- wday(time(rf_r1), week_start = getOption("lubridate.week.start", 1))
+
+# Attacati come colonne -> ancora xts
+data <- cbind(rf_r1, yday, wday)
+
+# Splitting (togli)
+data_train <- data[1:train_ndx, ]
+```
+
+-   Ottengo X2 che sarà una matrice dei regressori (sempre xts) che contiene regressori normali e ritardi
+
+-   Cambiare questo
+
+    -   In questo caso, a differenza di sopra, crea la matrice dei ritardi anche sul validation usando la ground truth, questo non va bene per la CV, perchè dobbiamo usare le stime (altrimenti non testiamo se generalizza, nella realtà non sappiamo le previsioni future di y)
+
+    -   Cambiare e impostare stima ricorsiva come sopra
+
+    -   Attenzione che qui abbiamo anche i regressori, che invece è giusto siano usati con i dati veri
+
+    -   Invece i ritardi vanno aggiornati come sopra
+
+    -   **Riadatta quanto sopra**
+
+```{r}
+
+# questa parte tieni
+# -14 perchè sono scartati
+# qui definisce solo gli indici di split
+train_ndx2 <- 1:(validation_ndx-14)
+valid_ndx2 <- (validation_ndx-14+1):(nrow(train_validation)-14)
+
+# embed costruisce automaticamente la matrice dei ridarti -> come prima
+X2 <- embed(data_train$lordototale, 15) # Numero di ritardi + 1
+
+# Estrai y
+y2 <- X2[, 1] # Variabile target
+
+# attacco la matrice dei ritardi agli altri regressori
+X2 <- cbind(X2[, -1], data_train[-(1:14), c("Festivo","Pioggia","yday", "wday")]) # Regressori
+
+# Split training-test
+
+y_train2 <- y2[train_ndx2]
+X_train2 <- X2[train_ndx2, ]
+
+y_test2 <- y2[valid_ndx2]
+X_test2 <- X2[valid_ndx2,]
+
+# Addestramento modello
+
+rf2 <- randomForest(X_train2, y_train2,
+                    xtest = X_test2,
+                    ytest = y_test2)
+
+rf_pred2 <- rf2$test$predicted
+rf_pred2 <- as.xts(rf_pred2, order.by = date(head(validation, -1)))
+
+plot(y_test2, type = "l")
+lines(rf_pred2, type="l", col = "red")
+
+mape(y_test2, rf_pred2)
+rmse(y_test2, rf_pred2)
+```
+
+# TERZO MODELLO - REGRESSORI (stessi regressori precedenti, ma Festivo spezzato in diverse dummies, una per tipologia di festività)
+
+Molto simile al modello due
+
+-   La variabile festivo viene dummyzzata
+
+-   Anche qui cambiare la stima
+
+-   Si aggiungon oanche le dummy delle festività
+
+Da cambiare
+
+-   Usa fest_precovid.xlsx e non fest.xlsx
+
+-   Prendi da 2:18 per prendere il nuovo regressore
+
+```{r}
+df_festivi <- readxl::read_xlsx("../Dati aggiuntivi/fest_precovid.xlsx")
+dum_festivi_ts <- xts(df_festivi[, 2:18], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+```
+
+```{r}
+data3 <- subset(data, select = -c(2))
+data3 <- cbind(data3, dum_festivi_ts)
+
+data_train3 <- data3[1:train_ndx, ]
+```
+
+```{r}
+train_ndx3 <- 1:(validation_ndx-14)
+valid_ndx3 <- (validation_ndx-14+1):(nrow(train_validation)-14)
+
+X3 <- embed(data_train3$lordototale, 15) # Numero di ritardi + 1
+
+y3 <- X3[, 1] # Variabile target
+
+X3 <- cbind(X3[, -1], data_train3[-(1:14), c("Pioggia", "yday", "wday", "dec24", "dec25", "dec26", "jan1", "jan6", "aug15", "dec31", "eastsun", "eastermon",
+                                             "oct31", "nov1", "apr25", "mag1", "jun2", "martgrasso", "bridge")]) # Regressori
+
+# Split training-test
+
+y_train3 <- y3[train_ndx3]
+X_train3 <- X3[train_ndx3, ]
+
+y_test3 <- y3[valid_ndx3]
+X_test3 <- X3[valid_ndx3,]
+
+# Addestramento modello
+
+rf3 <- randomForest(X_train3, y_train3,
+                    xtest = X_test3,
+                    ytest = y_test3)
+
+rf_pred3 <- rf3$test$predicted
+rf_pred3 <- as.xts(rf_pred3, order.by = date(head(validation, -1)))
+
+plot(y_test3, type = "l")
+lines(rf_pred3, type="l", col = "red")
+
+mape(y_test3, rf_pred3)
+rmse(y_test3, rf_pred3)
+```
+
+# QUARTO MODELLO - MODELLO CON VECCHI REGRESSORI
+
+Questo cambia:
+
+-   Sono dei vecchi regressori, buttati tutti insieme per vedere che fa
+
+-   Non viene trattata come serie storica, è un random forest con i soli regressori
+
+-   Toglierlo
+
+```{r}
+# Preparazione dati
+
+# Metto i NA a 0
+r1$lordototale[is.na(r1$lordototale)] <- 0
+r1$scontrini[is.na(r1$scontrini)] <- 0  
+r1$Prezzo_medio_per_scontrino[is.na(r1$Prezzo_medio_per_scontrino)] <- 0
+
+r1$Giorno <- as.factor(r1$Giorno)
+r1$Giorno <- factor(r1$Giorno, levels=c('Monday','Tuesday','Wednesday',
+                                        'Thursday','Friday','Saturday',
+                                        'Sunday'))
+
+r1$Month <- as.factor(r1$Month)
+
+r1$Year <- as.factor(r1$Year)
+
+r1$Season <- as.factor(r1$Season)
+r1$Season <- factor(r1$Season, levels=c('Spring','Summer','Autumn', 'Winter'))
+
+r1$Weekend <- as.factor(r1$Weekend)
+
+r1$Festivo <- as.factor(r1$Festivo)
+
+r1$Pioggia <- as.factor(r1$Pioggia)
+
+r1$ColoreCOVID <- as.factor(r1$ColoreCOVID)
+
+r1 <- subset(r1, select = -c(X.1, X, id_ristorante, Location, Regione, Provincia, data, scontrini, Prezzo_medio_per_scontrino, ColoreCOVID,
+                             Dose1, Dose2, DoseUnica, Booster1, Booster3Dosi, Booster2, Dose1Cum, Dose2Cum, DoseUnicaCum, Booster1Cum, Booster3DosiCum,
+                             Booster2Cum))
+
+r1[is.na(r1)] <- 0
+```
+
+```{r}
+# Divisione train-validation-test
+
+train_validation4 <- r1[1:train_ndx, ]
+train4 <- train_validation4[1:validation_ndx, ]
+validation4 <- train_validation4[-c(1:validation_ndx), ]
+test4 <- r1[-c(1:train_ndx), ]
+```
+
+```{r}
+rf4 <- randomForest(lordototale ~ Giorno + Month + Year + Season + Weekend + Festivo + Precipitazioni.mm. + Pioggia + BENZINA.LITRO + GASOLIO_AUTO.LITRO +
+                      GPL.LITRO + GASOLIO_RISCALDAMENTO.LITRO + O.C._FLUIDO_BTZ.LITRO + O.C._DENSO_BTZ.LITRO + Durum_Wheat + Feed_Barley + Maize +
+                      Milling_Wheat, data = train4)
+print(rf4)
+```
+
+```{r}
+rf_pred4 <- predict(rf4, newdata = validation4)
+rf_pred4 <- as.xts(rf_pred4, order.by = date(validation))
+
+plot(validation4$lordototale, type = "l")
+lines(rf_pred4, type="l", col = "red")
+
+mape(validation4$lordototale, rf_pred4)
+rmse(validation4$lordototale, rf_pred4)
+```
+
+# CONFRONTO MODELLI
+
+```{r}
+confronto <- cbind(validation, rf_pred1, rf_pred2, rf_pred3, rf_pred4)
+confronto_df <- fortify(confronto, melt = TRUE)
+```
+
+```{r}
+ggplot(aes(x = Index, y = Value, color = Series), data = confronto_df) + geom_line()
+```
+
+```{r}
+cat("Mod 1 - MAPE:", mape(validation, rf_pred1))
+cat("\nMod 2 - MAPE:", mape(y_test2, rf_pred2))
+cat("\nMod 3 - MAPE:", mape(y_test3, rf_pred3))
+cat("\nMod 4 - MAPE:", mape(validation4$lordototale, rf_pred4))
+
+cat("\nMod 1 - RMSE:", rmse(validation, rf_pred1))
+cat("\nMod 2 - RMSE:", rmse(y_test2, rf_pred2))
+cat("\nMod 3 - RMSE:", rmse(y_test3, rf_pred3))
+cat("\nMod 4 - RMSE:", rmse(validation4$lordototale, rf_pred4))
+```
+
+# Evaluation: Confronto forecasting performance dei modelli
+
+Questa parte del notebook può essere eseguita indipendentemente da quella sopra.
+
+## Scelta misura di *forecasting accuracy*
+
+Al fine di confrontare i diversi modelli definiti precedentemente è importante valutare le performance in termini forecasting accuracy. Prima di definire la procedura di calcolo della forecasting accuracy è importante selezionare la propria misura di accuratezza.
+
+Si sceglie di utilizzare due misure di accuratezza (**MAE, RMSE e MSE**) di tipo **scale-dependent** perchè:
+
+-   Misure di accuratezza basate su percentage errors e scaled errors (unit-free) sono indicate per comparare le performance di forecasting tra data set diversi
+
+-   Errori di tipo scale-dependent sono nella stessa scala dei dati, ma in questo caso non è un problema
+
+-   Si evitano tutte le problematiche relative alle misure di percentage errors legate:
+
+    -   al fatto che l'errore viene diviso per il valore dell'osservazione (valori infiniti per y che tende a 0)
+
+    -   penalità maggiori per errori negativi piuttosto che quelli positivi
+
+## Procedura di *Cross-Validation* con *rolling forecasting origin*
+
+Effettuo la procedura di *Time-Series Cross Validation* o *Evaluating on a Rolling Forecasting Origin* al fine di:
+
+-   Confrontare i diversi modelli in termini di Performance di Forecasting
+
+-   Potere allenare i modelli sull'intero dataset e non perdere i dati del test set (essendo questo già piccolo)
+
+-   Ottenere comunque due misure di performarmance di accuratezza di forecasting accuracy
+
+-   Determino la forecasting accuracy (come MAE/RMSE/MSE) per k-step avanti dove k (chiamato h, orizzonte, nella funzione `tsCV()`) sarà il mio orizzonte di previsione nel periodo covid
+
+    -   Confrontare l'andamento dei diversi modelli all'aumentare degli step ci consentirà di selezionare
+
+-   Parametri di cross-validation -\> Scelgo come tipologia di Time Series Cross Validation quella **Constant Holdout**
+
+    -   Scelgo arbitrariamente una finestra iniziale (**fixed origin**) di training (il numero minimo di osservazioni necessario a stimare il modello) come 120-\> parametro `initial`
+
+        -   È prassi impostare una finestra iniziale che sia almeno 3 volte l'orizzonte di previsione
+
+        -   Per i modelli con regessori che si realizzano annualmente (es. natale) la finestra iniziale sarà 1 anno (365 giorni)
+
+    -   **Non-Constant Holdout** -\> in modo da utilizzare tutti i dati per il training (altrimenti il training si fermerebbe all'osservazione n-h)
+
+    -   **Non-Constant In-Sample -\>** Non impostiamo il parametro `window`, che altrimenti andrebbe a settare un dimensione fissata del training set e quindi una moving window
+
+## Setup
+
+```{r}
+# Clean Workspace
+rm(list=ls())
+```
+
+```{r setup, include=FALSE}
+# Use 'verbatim = TRUE' as chunk option to show chunk code as is
+require(knitr)
+hook_source_def = knit_hooks$get('source')
+knit_hooks$set(source = function(x, options){
+  if (!is.null(options$verbatim) && options$verbatim){
+    opts = gsub(",\\s*verbatim\\s*=\\s*TRUE\\s*", "", options$params.src)
+    bef = sprintf('\n\n    ```{r %s}\n', opts, "\n")
+    stringr::str_c(bef, paste(knitr:::indent_block(x, "    "), collapse = '\n'), "\n    ```\n")
+  } else {
+     hook_source_def(x, options)
+  }
+})
+```
+
+```{r}
+set.seed(100)
+
+# Setting librerie utili
+# Package names
+packages <- c("readxl",  "readr", "forecast", "dplyr", "ggplot2",
+              "lubridate", "KFAS", "tseries", "xts", "randomForest") 
+
+# Install packages if not yet installed
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+# Packages loading
+invisible(lapply(packages, library, character.only = TRUE))
+
+
+# Setting working directory
+# working_dir = "C:/Users/marco/OneDrive/UNIMIB_DataScience/99-PROJECTS/DataScienceLab2022/Dati ristoranti"
+# setwd(working_dir)
+
+# MAPE 
+mape <- function(actual,pred){
+  mape <- mean(abs((actual - pred)/actual))*100
+  return (mape)
+}
+
+#MSE
+rmse <- function(actual, pred){
+  rmse <- sqrt(mean((actual - pred)^2))
+  return (rmse)
+}
+
+# Significatività dei parametri
+pars_test <- function(coef, var_coef){
+  test <- (1-pnorm(abs(coef)/sqrt(diag(var_coef))))*2
+  return(test)
+}
+
+# Grafico errore percentuale 
+err_plot <- function(actual, pred){
+  require(xts)
+  err_perc <- ((actual - xts(pred, order.by = index(actual)))/(xts(actual, order.by = index(actual))))*100
+  return(plot(err_perc, ylab="% errore", main="Errore percentuale di previsione"))
+
+}
+```
+## Definizione funzione di Time Series Cross-Validation (`tsCV_UCM()`)
+
+La funzione che ho definito è nello script `My-TSCrossValidation-Functions.R`  .
+
+```{r}
+#rm(list=ls())
+source("My-TSCrossValidation-Functions.R")
+```
+
+## Load Data
+
+Carico dataset
+
+```{r}
+r1 <- read.csv("..\\Dati ristoranti\\pre-covid_r1.csv")
+r1$data  <- parse_date(r1$data, "%Y-%m-%d", locale = locale("it"))
+
+df_festivi <- readxl::read_xlsx("../Dati aggiuntivi/fest_precovid.xlsx")
+```
+
+## Definizione funzioni dei modelli
+
+```{r}
+#f_mod1 <- function(Y, h, newxreg = NULL) {
+#  # Definizione e train del modello
+#  rf1 <- randomForest(y~., data = Y)
+#  
+#  # Definizione vettore vuoto che conterrà le previsioni
+#  y_hat <- numeric(h)
+#  
+#  ## Regressori per le previsioni
+#  # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+#  X <- Y[nrow(Y), -15, drop = FALSE] 
+#  colnames(X) <- colnames(Y)[-1] 
+#  
+#  # Itero la generazione dei regressori sulle h previsioni
+#  for (i in 1:h) {
+#    y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True #mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti #e a prenderne la mediana (in alternativa, la media)
+#    # Produco lo shift in X
+#    # X viene aggionrato ogni volta, le stime entrano dei regressori
+#    X[1, 2:14] <- X[1, 1:13]
+#    X[1, 1] <- y_hat[i]
+#  }
+#  return(y_hat)
+#}
+#
+#f_mod2 <- function(Y, h, newxreg = NULL) {
+#  # Definizione e train del modello
+#  rf1 <- randomForest(y~., data = Y)
+#  
+#  # Definizione vettore vuoto che conterrà le previsioni
+#  y_hat <- numeric(h)
+#  
+#  ## Regressori per le previsioni
+#  # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+#  X <- Y[nrow(Y), -15, drop = FALSE] 
+#  colnames(X) <- colnames(Y)[-1] 
+#  
+#  # Itero la generazione dei regressori sulle h previsioni
+#  for (i in 1:h) {
+#    y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True #mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti #e a prenderne la mediana (in alternativa, la media)
+#    # Produco lo shift in X
+#    # X viene aggionrato ogni volta, le stime entrano dei regressori
+#    X[1, 2:14] <- X[1, 1:13]
+#    # Aggiorniamo anche i regressori
+#    X[1, c("Festivo", "Pioggia", "yday", "wday")] <- newxreg[i, c("Festivo", "Pioggia", "yday", #"wday")]
+#    X[1, 1] <- y_hat[i]
+#  }
+#  return(y_hat)
+#}
+#
+#f_mod3 <- function(Y, h, newxreg = NULL) {
+#  # Definizione e train del modello
+#  rf1 <- randomForest(y~., data = Y)
+#  
+#  # Definizione vettore vuoto che conterrà le previsioni
+#  y_hat <- numeric(h)
+#  
+#  ## Regressori per le previsioni
+#  # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+#  X <- Y[nrow(Y), -15, drop = FALSE] 
+#  colnames(X) <- colnames(Y)[-1] 
+#  
+#  # Itero la generazione dei regressori sulle h previsioni
+#  for (i in 1:h) {
+#    y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True #mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti #e a prenderne la mediana (in alternativa, la media)
+#    # Produco lo shift in X
+#    # X viene aggionrato ogni volta, le STIME entrano dei regressori
+#    X[1, 2:14] <- X[1, 1:13]
+#    # Aggiorniamo anche i regressori con i VALORI VERI del validation
+#    X[1, 15:ncol(X)] <- newxreg[i, ]
+#    X[1, 1] <- y_hat[i]
+#  }
+#  return(y_hat)
+#}
+```
+
+### Funzioni fixate
+
+```{r}
+f_mod1 <- function(Y, h, newxreg = NULL) {
+  # Definizione e train del modello
+  rf1 <- randomForest(y~., data = Y)
+  
+  # Definizione vettore vuoto che conterrà le previsioni
+  y_hat <- numeric(h)
+  
+  ## Regressori per le previsioni
+  # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+  X <- Y[nrow(Y), -15, drop = FALSE] 
+  colnames(X) <- colnames(Y)[-1] 
+  
+  # Itero la generazione dei regressori sulle h previsioni
+  for (i in 1:h) {
+    y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti e a prenderne la mediana (in alternativa, la media)
+    # Produco lo shift in X
+    # X viene aggionrato ogni volta, le stime entrano dei regressori
+    X[1, 2:14] <- X[1, 1:13]
+    X[1, 1] <- y_hat[i]
+  }
+  return(y_hat)
+}
+
+f_mod2 <- function(Y, h, newxreg = NULL) {
+  # Definizione e train del modello
+  rf1 <- randomForest(y~., data = Y)
+  
+  # Definizione vettore vuoto che conterrà le previsioni
+  y_hat <- numeric(h)
+  
+  ## Regressori per le previsioni
+  # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+  X <- Y[nrow(Y), -15, drop = FALSE] 
+  colnames(X) <- colnames(Y)[-1] 
+  
+  # Itero la generazione dei regressori sulle h previsioni
+  for (i in 1:h) {
+    # Aggiorniamo anche i regressori
+    X[1, c("Festivo", "Pioggia", "yday", "wday")] <- newxreg[i, c("Festivo", "Pioggia", "yday", "wday")]
+    y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti e a prenderne la mediana (in alternativa, la media)
+    # Produco lo shift in X
+    # X viene aggionrato ogni volta, le stime entrano dei regressori
+    X[1, 2:14] <- X[1, 1:13]
+    X[1, 1] <- y_hat[i]
+  }
+  return(y_hat)
+}
+
+f_mod3 <- function(Y, h, newxreg = NULL) {
+  # Definizione e train del modello
+  rf1 <- randomForest(y~., data = Y)
+  
+  # Definizione vettore vuoto che conterrà le previsioni
+  y_hat <- numeric(h)
+  
+  ## Regressori per le previsioni
+  # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+  X <- Y[nrow(Y), -15, drop = FALSE] 
+  colnames(X) <- colnames(Y)[-1] 
+  
+  # Itero la generazione dei regressori sulle h previsioni
+  for (i in 1:h) {
+    # Aggiorniamo anche i regressori con i VALORI VERI del validation
+    X[1, 15:ncol(X)] <- newxreg[i, ]
+    y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti e a prenderne la mediana (in alternativa, la media)
+    # Produco lo shift in X
+    # X viene aggionrato ogni volta, le STIME entrano dei regressori
+    X[1, 2:14] <- X[1, 1:13]
+    X[1, 1] <- y_hat[i]
+  }
+  return(y_hat)
+}
+```
+
+## Cross-Validation e eventuali processing ad hoc
+
+```{r}
+# Parametri di cross-validation globali
+h = 74 # 6 settimane
+initial = 200 # Un anno 365
+window = NULL # no moving window, si rolling origin
+
+# Calcolo tempo di computazione
+start.time <- Sys.time()
+print(start.time)
+
+# Pre processing modello 1
+
+rf_r1 <- xts(r1[, "lordototale"], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+
+# CV su MODELLO 1
+
+e_1 <- tsCV_RandomForest(my_xts = rf_r1[,1], forecastfunction = f_mod1, h=h, initial = initial, window = window)
+e1 <- e_1$e
+e1_percentage <- e_1$e_percentage
+e1_estimate <- e_1$y_estimate
+e1_groundtruth <- e_1$y_groundtruth
+
+# Pre processing modello 2
+
+rf_r1 <- xts(r1[, c("lordototale", "Festivo", "Pioggia")], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+
+rf_r1$Festivo[rf_r1$Festivo=="False"] <- 0
+rf_r1$Festivo[rf_r1$Festivo=="True"] <- 1
+rf_r1$Pioggia[rf_r1$Pioggia==""] <- 0
+rf_r1$Pioggia[rf_r1$Pioggia=="True"] <- 1
+yday <- yday(time(rf_r1))
+wday <- wday(time(rf_r1), week_start = getOption("lubridate.week.start", 1))
+data <- cbind(rf_r1, yday, wday)
+
+# CV su MODELLO 2
+
+e_2 <- tsCV_RandomForest(my_xts = data[,1], xreg = data[,-1], forecastfunction = f_mod2, h=h, initial = initial, window = window)
+e2 <- e_2$e
+e2_percentage <- e_2$e_percentage
+e2_estimate <- e_2$y_estimate
+e2_groundtruth <- e_2$y_groundtruth
+
+# Pre processing modello 3
+
+dum_festivi_ts <- xts(df_festivi[, 2:18], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+
+data3 <- subset(data, select = -c(2))
+data3 <- cbind(data3, dum_festivi_ts)
+
+# CV su MODELLO 3
+
+e_3 <- tsCV_RandomForest(my_xts = data3[,1], xreg = data3[,-1], forecastfunction = f_mod3, h=h, initial = initial, window = window)
+e3 <- e_3$e
+e3_percentage <- e_3$e_percentage
+e3_estimate <- e_3$y_estimate
+e3_groundtruth <- e_3$y_groundtruth
+
+end.time <- Sys.time()
+print(end.time)
+time.taken <- end.time - start.time
+print(time.taken)
+```
+Salvataggio
+
+```{r}
+matrices <- list(e1 = e1, e1_percentage = e1_percentage, e1_estimate = e1_estimate, e1_groundtruth = e1_groundtruth, e2 = e2, e2_percentage = e2_percentage, e2_estimate = e2_estimate, e2_groundtruth = e2_groundtruth, e3 = e3, e3_percentage = e3_percentage, e3_estimate = e3_estimate, e3_groundtruth = e3_groundtruth)
+
+for (i in 1:length(matrices)) {
+  write.csv(data.frame(date=index(matrices[[i]]), coredata(matrices[[i]])),
+            paste0("./Errors/RandomForest/RandomForest_PreCovid_", names(matrices)[i], ".csv"))
+}
+
+```
+
+```{r}
+h=74
+y_test <- read.csv("./Errors/RandomForest/RandomForest_PreCovid_e1.csv")
+y_test$date  <- parse_date(y_test$date, "%Y-%m-%d", locale = locale("it"))
+y_test <- xts(y_test[, c(-1,-2)], as.Date(as.character(y_test$date), format = "%Y-%m-%d"))
+colnames(y_test) <- paste("h=", 1:h, sep = "")
+
+```
+
+
+## Analisi degli errori
+
+### Errori troncati
+
+Andiamo a tenere solo 1 riga su h della matrice degli errori, simulando quindi un avanzamento di training e test di h osservazioni ogni iterazione.
+
+```{r}
+test <- as.data.frame(e1)
+indices <- seq(1, nrow(test), by = 1)
+test1 <- test[indices,]
+
+RMSE_mod1_test <- sqrt(colMeans(test1^2, na.rm = TRUE))
+
+plot(1:42, RMSE_mod1_test, type="l", col=1, xlab="horizon", ylab="RMSE", ylim = c(2500,6000))
+
+```
+Vediamo sui modelli con regressori
+
+```{r}
+test <- as.data.frame(e1)
+indices <- seq(1, nrow(test), by = 7)
+test1 <- test[indices,]
+
+RMSE_mod3_test <- sqrt(colMeans(test1^2, na.rm = TRUE))
+
+plot(1:42, RMSE_mod3_test, type="l", col=1, xlab="horizon", ylab="RMSE", ylim = c(0,10000))
+```
+
+### Studio specifico degli errori 
+
+#### 1-step
+
+```{r}
+check1 <- cbind(e1[,"h=1"], e1_estimate[,"h=1"], e1_groundtruth[,"h=1"])
+colnames(check1) <- c("e1", "e1_estimate", "e1_groundtruth")
+# tengo solo righe con errori molto elevati
+check1 <- as_tibble(check1)
+check1[,1] <- as.numeric(unlist(check1[,1]))
+#check1 <- filter(check1, abs(e1) > 4000)
+print(nrow(check1))
+check1 <- xts(check1, order.by = index(data3))
+View(check1)
+
+check2 <- cbind(e2[,"h=1"], e2_estimate[,"h=1"], e2_groundtruth[,"h=1"])
+colnames(check2) <- c("e2", "e2_estimate", "e2_groundtruth")
+# tengo solo righe con errori molto elevati
+check2 <- as_tibble(check2)
+check2[,1] <- as.numeric(unlist(check2[,1]))
+#check2 <- filter(check2, abs(e2) > 4000)
+print(nrow(check2))
+check2 <- xts(check2, order.by = index(data3))
+View(check2)
+
+check3 <- cbind(e3[,"h=1"], e3_estimate[,"h=1"], e3_groundtruth[,"h=1"])
+colnames(check3) <- c("e3", "e3_estimate", "e3_groundtruth")
+# tengo solo righe con errori molto elevati
+check3 <- as_tibble(check3)
+check3[,1] <- as.numeric(unlist(check3[,1]))
+#check3 <- filter(check3, abs(e3) > 4000)
+print(nrow(check3))
+check3 <- xts(check3, order.by = index(data3))
+View(check3)
+
+```
+Vediamo se ci sono giorni della settimana particolarmente sbagliati
+
+```{r}
+#table(check1$wday)
+#table(check2$wday)
+#table(check3$wday)
+```
+Vediamo se c'è un giorno dell'anno che tutti i modelli sbagliano
+
+```{r}
+#common_values <- Reduce(intersect, list(check1$data, check2$data, check3$data, check4$data))
+#common_values
+```
+
+#### 7-step
+
+```{r}
+check1 <- cbind(e1[,"h=7"], e1_estimate[,"h=7"], e1_groundtruth[,"h=7"])
+colnames(check1) <- c("e1", "e1_estimate", "e1_groundtruth")
+# tengo solo righe con errori molto elevati
+check1 <- as_tibble(check1)
+check1[,1] <- as.numeric(unlist(check1[,1]))
+#check1 <- filter(check1, abs(e1) > 4000)
+print(nrow(check1))
+check1 <- xts(check1, order.by = index(data3))
+View(check1)
+
+check2 <- cbind(e2[,"h=7"], e2_estimate[,"h=7"], e2_groundtruth[,"h=7"])
+colnames(check2) <- c("e2", "e2_estimate", "e2_groundtruth")
+# tengo solo righe con errori molto elevati
+check2 <- as_tibble(check2)
+check2[,1] <- as.numeric(unlist(check2[,1]))
+#check2 <- filter(check2, abs(e2) > 4000)
+print(nrow(check2))
+check2 <- xts(check2, order.by = index(data3))
+View(check2)
+
+check3 <- cbind(e3[,"h=7"], e3_estimate[,"h=7"], e3_groundtruth[,"h=7"])
+colnames(check3) <- c("e3", "e3_estimate", "e3_groundtruth")
+# tengo solo righe con errori molto elevati
+check3 <- as_tibble(check3)
+check3[,1] <- as.numeric(unlist(check3[,1]))
+#check3 <- filter(check3, abs(e3) > 4000)
+print(nrow(check3))
+check3 <- xts(check3, order.by = index(data3))
+View(check3)
+```
+#### 21-step
+
+```{r}
+check1 <- cbind(e1[,"h=21"], e1_estimate[,"h=21"], e1_groundtruth[,"h=21"])
+colnames(check1) <- c("e1", "e1_estimate", "e1_groundtruth")
+# tengo solo righe con errori molto elevati
+check1 <- as_tibble(check1)
+check1[,1] <- as.numeric(unlist(check1[,1]))
+#check1 <- filter(check1, abs(e1) > 4000)
+print(nrow(check1))
+check1 <- xts(check1, order.by = index(data3))
+View(check1)
+
+check2 <- cbind(e2[,"h=21"], e2_estimate[,"h=21"], e2_groundtruth[,"h=21"])
+colnames(check2) <- c("e2", "e2_estimate", "e2_groundtruth")
+# tengo solo righe con errori molto elevati
+check2 <- as_tibble(check2)
+check2[,1] <- as.numeric(unlist(check2[,1]))
+#check2 <- filter(check2, abs(e2) > 4000)
+print(nrow(check2))
+check2 <- xts(check2, order.by = index(data3))
+View(check2)
+
+check3 <- cbind(e3[,"h=21"], e3_estimate[,"h=21"], e3_groundtruth[,"h=21"])
+colnames(check3) <- c("e3", "e3_estimate", "e3_groundtruth")
+# tengo solo righe con errori molto elevati
+check3 <- as_tibble(check3)
+check3[,1] <- as.numeric(unlist(check3[,1]))
+#check3 <- filter(check3, abs(e3) > 4000)
+print(nrow(check3))
+check3 <- xts(check3, order.by = index(data3))
+View(check3)
+```
+
+## Confrontro tra i modelli
+
+### RMSE
+
+```{r}
+RMSE_mod1 <- sqrt(colMeans(e1^2, na.rm = TRUE))
+RMSE_mod2 <- sqrt(colMeans(e2^2, na.rm = TRUE))
+RMSE_mod3 <- sqrt(colMeans(e3^2, na.rm = TRUE))
+
+# Zoom in
+#plot(1:42, RMSE_mod1, type="l", col=1, xlab="horizon", ylab="RMSE", ylim = c(2500,5000))
+#lines(1:42, RMSE_mod2, type="l",col=2)
+#lines(1:42, RMSE_mod3, type="l",col=3)
+#legend("topleft",legend=c("1_RandomForest_noregr","2_RandomForest_regr","3_RandomForest_regr"),col=1:3,lty=1)
+
+# Zoom out
+plot(1:74, RMSE_mod1, type="l", col=1, xlab="horizon", ylab="RMSE", ylim = c(0,13000))
+lines(1:74, RMSE_mod2, type="l",col=2)
+lines(1:74, RMSE_mod3, type="l",col=3)
+legend("topleft",legend=c("1_RandomForest_noregr","2_RandomForest_regr","3_RandomForest_regr_DUmmy"),col=1:3,lty=1)
+```
+Valori medi
+```{r}
+mean(RMSE_mod1)
+mean(RMSE_mod2)
+mean(RMSE_mod3)
+
+```
+
+
+Check confronto con quello che dovrebbe essere il risultato di train/test
+```{r}
+subset(e2, index(e2) == "2019-09-25")[,1:43]
+
+sqrt(mean((subset(e1, index(e1) == "2019-09-25")[,1:43])^2))
+
+sqrt(mean((subset(e2, index(e2) == "2019-09-25")[,1:43])^2))
+
+sqrt(mean((subset(e3, index(e3) == "2019-09-25")[,1:43])^2))
+
+```
+```{r}
+plot(1:74, e3_estimate["2019-09-25", ], col = "blue", type = "l")
+lines(1:74, e1_groundtruth["2019-09-25", ], col = "red", type = "l")
+title("Grafico delle misure di e2")
+xlab("Tempo")
+ylab("Misura di e2")
+```
+
+```{r}
+plot(1:74, e2_estimate["2019-09-25", ], col = "blue", type = "l")
+lines(1:74, e2_groundtruth["2019-09-25", ], col = "red", type = "l")
+lines(1:74, c(as.list(e2_estimate["2019-09-25", 2:74]), NA), col = "black", type = "l")
+title("Grafico delle misure di e2")
+xlab("Tempo")
+ylab("Misura di e2")
+```
+```{r}
+stime_shiftate <- c(as.list(e2_estimate["2019-09-25", 2:74]), NA)
+#stime_shiftate <- as.list(e2_estimate["2019-10-25", ])
+truth <- as.list(e2_groundtruth["2019-09-25", ])
+result <- unlist(Map(function(x, y) x - y, truth, stime_shiftate))
+sqrt(mean(result[1:43]^2))
+```
+
+
+### RMdSE
+
+```{r}
+library(robustbase)
+
+RMdSE_mod1 <- sqrt(colMedians(e1^2, na.rm = TRUE, hasNA = TRUE))
+RMdSE_mod2 <- sqrt(colMedians(e2^2, na.rm = TRUE, hasNA = TRUE))
+RMdSE_mod3 <- sqrt(colMedians(e3^2, na.rm = TRUE, hasNA = TRUE))
+
+# Zoom in
+plot(1:74, RMdSE_mod1, type="l", col=1, xlab="horizon", ylab="RMdSE", ylim = c(0,5000))
+lines(1:74, RMdSE_mod2, type="l",col=2)
+lines(1:74, RMdSE_mod3, type="l",col=3)
+legend("topleft",legend=c("1_RandomForest_noregr","2_RandomForest_regr","3_RandomForest_regr_DUmmy"),col=1:3,lty=1)
+
+```
+
+### MAE
+
+```{r}
+MAE_mod1 <- colMeans(abs(e1), na.rm = TRUE)
+MAE_mod2 <- colMeans(abs(e2), na.rm = TRUE)
+MAE_mod3 <- colMeans(abs(e3), na.rm = TRUE)
+
+plot(1:74, MAE_mod1, type="l", col=1, xlab="horizon", ylab="MAE", ylim = c(0,13000))
+lines(1:74, MAE_mod2, type="l",col=2)
+lines(1:74, MAE_mod3, type="l",col=3)
+legend("topleft",legend=c("1_RandomForest_noregr","2_RandomForest_regr","3_RandomForest_regrDummy"),col=1:3,lty=1)
+```
+### MAPE
+
+```{r}
+MAPE_mod1 <- colMeans(abs(e1_percentage), na.rm = TRUE)
+MAPE_mod2 <- colMeans(abs(e2_percentage), na.rm = TRUE)
+MAPE_mod3 <- colMeans(abs(e3_percentage), na.rm = TRUE)
+
+plot(1:74, MAPE_mod1, type="l", col=1, xlab="horizon", ylab="MAPE", ylim = c(0,100))
+lines(1:74, MAPE_mod2, type="l",col=2)
+lines(1:74, MAPE_mod3, type="l",col=3)
+legend("topleft",legend=c("1_RandomForest_noregr","2_RandomForest_regr","3_RandomForest_regrDummy"),col=1:3,lty=1)
+```
+Valori medi
+```{r}
+mean(MAPE_mod1)
+mean(MAPE_mod2)
+mean(MAPE_mod3)
+
+```
+
+## Debug
+
+### Debug terza funzione
+
+```{r}
+# dum_festivi_ts <- xts(df_festivi[, 2:18], as.Date(as.character(r1$data), format = "%Y-%m-%d"))
+# 
+# data3 <- subset(data, select = -c(2))
+# data3 <- cbind(data3, dum_festivi_ts)
+# 
+# my_xts = data3[,1]
+# xreg = data3[,-1]
+# n <- nrow(my_xts)
+# 
+# if (nrow(xreg) != nrow(my_xts)) 
+#             stop("xreg must be of the same size as y")
+#         
+#         # Creo una matrixe xts di NA, che parte dall'ultimo giorno + 1 della nostra serie storica
+#         na_df <- seq(from = end(my_xts) + 1, 
+#             to = end(my_xts) + h, 
+#             by = "day")
+#         # Stessa cosa per i regressori
+#         na_df_xreg <- seq(from = end(xreg) + 1, 
+#             to = end(xreg) + h, 
+#             by = "day")
+# 
+#         # Aggiungo la matrice dei NA alla fine della serie storica e della matrice dei regressori
+#         my_xts <- merge(my_xts, na_df)
+#         xreg <- merge(xreg, na_df_xreg)
+#         
+# if (is.null(window)) {
+#   indx <- seq(1 + initial, n - 1L)
+# } else {
+#     indx <- seq(window + initial, n - 1L, by = 1L)
+# }
+#         
+# i = 366
+# 
+# start <- ifelse(is.null(window), 1L, ifelse(i - window >= 0L, i - window + 1L, stop("small window")))
+# end <- i  # imposto come end i + h perchè così ho il train
+# 
+# y_subset <- my_xts[start:end,]
+# y_test <- my_xts[(end + 1):(end + h),]
+# 
+# y_subset <- xts(embed(y_subset, 15), order.by = index(tail(y_subset, n = -14)))
+# colnames(y_subset) <- c("y", paste0("y_", 1:14))
+# 
+# xreg_subset <- xreg[start:end,]
+# xreg_future <- xreg[(end + 1):(end + h),]
+# 
+# ## Combino i regressori di train con la matrice dei ritardi e y
+# # Rimuovo le prime 14 osservazioni di xreg
+# xreg_subset <- tail(xreg_subset, n = -14)
+# # Combino
+# Y <- cbind(y_subset, xreg_subset)
+# names(Y) <- c(names(y_subset), names(xreg_subset))
+# 
+# rf1 <- randomForest(y~., data = Y)
+#   
+# # Definizione vettore vuoto che conterrà le previsioni
+# y_hat <- numeric(h)
+# 
+# ## Regressori per le previsioni
+# # Prendo ultima riga della matrice dei regressori, elimino l'ultimo ritardo
+# X <- Y[nrow(Y), -15, drop = FALSE] 
+# colnames(X) <- colnames(Y)[-1] 
+# 
+# newxreg <- xreg_future
+# 
+# # Itero la generazione dei regressori sulle h previsioni
+# for (i in 1:h) {
+#   y_hat[i] <- predict(rf1, X, predict.all = TRUE)$individual |> median() # predict.all=True mantiene la stima data da tutti gli alberi nella foresta. Dopodichè si vanno a selezionare tutti e a prenderne la mediana (in alternativa, la media)
+#   # Produco lo shift in X
+#   # X viene aggionrato ogni volta, le STIME entrano dei regressori
+#   #print(1)
+#   X[1, 2:14] <- X[1, 1:13]
+#   # Aggiorniamo anche i regressori con quelli più recenti VERI
+#   X[1, 15:ncol(X)] <- newxreg[i, ]
+#   X[1, 1] <- y_hat[i]
+# }
+# 
+# fc <- as.xts(y_hat, order.by = date(y_test))
+# e[i, ] <- y_test[seq(h)] - fc[seq(h)]
+```
